@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Surveillance Node</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; }
+    .grid { display: grid; gap: 12px; grid-template-columns: 2fr 1fr; }
+    .panel { background: #1f1f1f; border: 1px solid #333; border-radius: 8px; padding: 12px; }
+    img { width: 100%; background: #000; border-radius: 8px; }
+    label { display: block; margin-top: 8px; }
+    input, select, button { width: 100%; padding: 8px; margin-top: 4px; }
+    .row { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+  </style>
+</head>
+<body>
+  <h1>Surveillance (Node.js)</h1>
+  <div class="grid">
+    <div class="panel">
+      <img id="video" alt="video stream" />
+      <button id="talkToggle">Hold to Talk</button>
+    </div>
+    <div class="panel">
+      <h3>Camera</h3>
+      <label>Device<select id="cameraDevice"></select></label>
+      <label>Resolution<select id="resolution"></select></label>
+      <label>FPS<input id="fps" type="number" /></label>
+      <button id="saveCamera">Save Camera Settings</button>
+
+      <h3>Audio Devices</h3>
+      <label>Microphone<select id="microphone"></select></label>
+      <label>Speaker<select id="speaker"></select></label>
+      <button id="saveAudioDevices">Save Audio Devices</button>
+
+      <h3>Speaker Volume</h3>
+      <label>Volume<input id="volume" type="range" min="0" max="100" /></label>
+      <button id="saveVolume">Apply Volume</button>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
