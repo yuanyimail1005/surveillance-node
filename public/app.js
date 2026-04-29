@@ -17,6 +17,13 @@ const cameraResolutionsByDevice = new Map();
 let currentVideoObjectUrl = null;
 let pendingVideoBlob = null;
 let videoDecodeInFlight = false;
+let nextAudioPlayTime = 0;
+let droppedAudioChunks = 0;
+let speakerMeterSmooth = 0;
+let micMeterSmooth = 0;
+
+const AUDIO_MIN_LEAD_SECONDS = 0.02;
+const AUDIO_MAX_BUFFER_SECONDS = 0.4;
 
 const renderLatestVideoFrame = () => {
   if (videoDecodeInFlight || !pendingVideoBlob) return;
@@ -81,18 +88,98 @@ const startVideo = () => {
 
 const startAudio = () => {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  nextAudioPlayTime = audioCtx.currentTime;
   audioSocket = new WebSocket(`${wsBase}/audio_feed`);
   audioSocket.binaryType = 'arraybuffer';
   audioSocket.onmessage = async (event) => {
-    const data = new Int16Array(event.data);
-    const buffer = audioCtx.createBuffer(1, data.length, 48000);
-    const channel = buffer.getChannelData(0);
-    for (let i = 0; i < data.length; i += 1) channel[i] = data[i] / 32768;
-    const source = audioCtx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtx.destination);
-    source.start();
+    const sampleCount = Math.floor(event.data.byteLength / 2);
+    if (sampleCount <= 0) return;
+    const data = new Int16Array(event.data, 0, sampleCount);
+    playAudioChunk(data);
   };
+  audioSocket.onclose = () => {
+    resetVolumeMeter('speaker-volume-bar', 'speaker-volume-text', 'speaker');
+  };
+};
+
+const rmsToPercent = (rms) => {
+  const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+  return Math.min(100, Math.max(0, Math.round(((db + 70) / 60) * 100)));
+};
+
+const volumeLabel = (percent) => {
+  if (percent < 5) return 'Silent';
+  if (percent < 25) return 'Low';
+  if (percent < 75) return 'Good';
+  return 'High';
+};
+
+const updateVolumeMeter = (barId, textId, rawPercent, meterType) => {
+  const bar = document.getElementById(barId);
+  const text = document.getElementById(textId);
+  if (!bar || !text) return;
+
+  const clamped = Math.min(100, Math.max(0, rawPercent));
+  const prev = meterType === 'speaker' ? speakerMeterSmooth : micMeterSmooth;
+  const smooth = Math.round(prev * 0.72 + clamped * 0.28);
+  
+  if (meterType === 'speaker') {
+    speakerMeterSmooth = smooth;
+  } else {
+    micMeterSmooth = smooth;
+  }
+
+  bar.style.width = smooth + '%';
+  text.textContent = `${smooth}% · ${volumeLabel(smooth)}`;
+};
+
+const resetVolumeMeter = (barId, textId, meterType) => {
+  if (meterType === 'speaker') {
+    speakerMeterSmooth = 0;
+  } else {
+    micMeterSmooth = 0;
+  }
+  updateVolumeMeter(barId, textId, 0, meterType);
+};
+
+const playAudioChunk = (int16Array) => {
+  const buffer = audioCtx.createBuffer(1, int16Array.length, 48000);
+  const channel = buffer.getChannelData(0);
+  
+  let sumSq = 0;
+  for (let i = 0; i < int16Array.length; i += 1) {
+    let s = int16Array[i] / 32768;
+    if (s > 0.98) s = 0.98;
+    if (s < -0.98) s = -0.98;
+    channel[i] = s;
+    sumSq += s * s;
+  }
+  
+  const rms = Math.sqrt(sumSq / int16Array.length);
+  const volumePercent = rmsToPercent(rms);
+  updateVolumeMeter('speaker-volume-bar', 'speaker-volume-text', volumePercent, 'speaker');
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  if (nextAudioPlayTime > now + AUDIO_MAX_BUFFER_SECONDS) {
+    // Drop stale audio chunks when playback queue drifts too far behind live time.
+    nextAudioPlayTime = now + AUDIO_MIN_LEAD_SECONDS;
+    droppedAudioChunks += 1;
+    if (droppedAudioChunks % 20 === 0) {
+      console.debug(`Dropped ${droppedAudioChunks} stale audio chunks`);
+    }
+    return;
+  }
+
+  if (nextAudioPlayTime < now + AUDIO_MIN_LEAD_SECONDS) {
+    nextAudioPlayTime = now + AUDIO_MIN_LEAD_SECONDS;
+  }
+
+  source.start(nextAudioPlayTime);
+  nextAudioPlayTime += buffer.duration;
 };
 
 const fillResolutionOptions = (resolutions, selectedWidth, selectedHeight) => {
@@ -184,9 +271,18 @@ const loadAudioDevices = async () => {
   });
 };
 
+const updateVolumeDisplay = () => {
+  const vol = Number(volumeInput.value) || 0;
+  const display = document.getElementById('currentVolumeDisplay');
+  if (display) {
+    display.textContent = `${vol}% (Server Volume)`;
+  }
+};
+
 const loadVolume = async () => {
   const data = await fetchJson('/speaker_volume');
   volumeInput.value = data.volume;
+  updateVolumeDisplay();
 };
 
 document.getElementById('saveCamera').onclick = async () => {
@@ -225,32 +321,133 @@ document.getElementById('saveVolume').onclick = async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ volume: Number(volumeInput.value) })
   });
+  updateVolumeDisplay();
+};
+
+volumeInput.oninput = () => {
+  updateVolumeDisplay();
 };
 
 let isTalking = false;
+let micStream = null;
+let micSourceNode = null;
+let scriptProcessor = null;
 
 const startTalk = async () => {
-  talkSocket = new WebSocket(`${wsBase}/ws/talk`);
-  talkSocket.binaryType = 'arraybuffer';
+  try {
+    // Get microphone stream
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+        channelCount: 1,
+        sampleRate: 48000
+      }
+    });
 
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    // Create WebSocket for sending audio
+    talkSocket = new WebSocket(`${wsBase}/ws/talk`);
+    talkSocket.binaryType = 'arraybuffer';
+    
+    talkSocket.onerror = (error) => {
+      console.error('Talk socket error:', error);
+      stopTalk();
+    };
+    
+    talkSocket.onclose = () => {
+      console.log('Talk socket closed');
+      if (isTalking) stopTalk();
+    };
 
-  mediaRecorder.ondataavailable = async (e) => {
-    if (!e.data || !e.data.size || talkSocket.readyState !== WebSocket.OPEN) return;
-    const buf = await e.data.arrayBuffer();
-    talkSocket.send(buf);
-  };
-  mediaRecorder.start(100);
-  isTalking = true;
-  document.getElementById('talkToggle').textContent = 'Stop Talk';
+    // Create audio context if not exists
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    }
+
+    // Create media stream source and script processor for raw audio capture
+    micSourceNode = audioCtx.createMediaStreamSource(micStream);
+    scriptProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    let sendCount = 0;
+    scriptProcessor.onaudioprocess = (event) => {
+      if (!isTalking || talkSocket.readyState !== WebSocket.OPEN) return;
+
+      const inputData = event.inputBuffer.getChannelData(0);
+      
+      // Calculate RMS for microphone meter
+      let sumSq = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        sumSq += inputData[i] * inputData[i];
+      }
+      const rms = Math.sqrt(sumSq / inputData.length);
+      const volumePercent = rmsToPercent(rms);
+      updateVolumeMeter('mic-volume-bar', 'mic-volume-text', volumePercent, 'mic');
+
+      // Convert float32 to int16
+      const int16 = new Int16Array(inputData.length);
+      for (let i = 0; i < inputData.length; i++) {
+        let s = Math.max(-1, Math.min(1, inputData[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+
+      // Send to server
+      try {
+        talkSocket.send(int16.buffer);
+      } catch (e) {
+        console.error('Failed to send audio chunk:', e);
+      }
+
+      sendCount++;
+      if (sendCount % 10 === 0) {
+        console.debug(`Sending microphone: ${volumePercent}%`);
+      }
+    };
+
+    micSourceNode.connect(scriptProcessor);
+    scriptProcessor.connect(audioCtx.destination);
+
+    isTalking = true;
+    document.getElementById('talkToggle').textContent = 'Stop Talk';
+    console.log('Microphone capture started');
+  } catch (error) {
+    console.error('Failed to start talkback:', error);
+    alert(`Microphone error: ${error.message}`);
+    stopTalk();
+  }
 };
 
 const stopTalk = () => {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  if (talkSocket && talkSocket.readyState === WebSocket.OPEN) talkSocket.close();
   isTalking = false;
+  
+  // Clean up audio nodes
+  if (scriptProcessor) {
+    scriptProcessor.onaudioprocess = null;
+    scriptProcessor.disconnect();
+    scriptProcessor = null;
+  }
+  
+  if (micSourceNode) {
+    micSourceNode.disconnect();
+    micSourceNode = null;
+  }
+  
+  // Stop all microphone tracks
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+  
+  // Close WebSocket
+  if (talkSocket && (talkSocket.readyState === WebSocket.OPEN || talkSocket.readyState === WebSocket.CONNECTING)) {
+    talkSocket.close();
+    talkSocket = null;
+  }
+  
+  // Reset microphone meter
+  resetVolumeMeter('mic-volume-bar', 'mic-volume-text', 'mic');
   document.getElementById('talkToggle').textContent = 'Hold to Talk';
+  console.log('Microphone capture stopped');
 };
 
 document.getElementById('talkToggle').onclick = async () => {
