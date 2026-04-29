@@ -14,32 +14,43 @@ let audioSocket;
 let talkSocket;
 let mediaRecorder;
 const cameraResolutionsByDevice = new Map();
-let latestVideoData = null;
-let videoRenderScheduled = false;
 let currentVideoObjectUrl = null;
+let pendingVideoBlob = null;
+let videoDecodeInFlight = false;
 
-const scheduleVideoRender = () => {
-  if (videoRenderScheduled) return;
-  videoRenderScheduled = true;
-  requestAnimationFrame(() => {
-    videoRenderScheduled = false;
-    if (!latestVideoData) return;
+const renderLatestVideoFrame = () => {
+  if (videoDecodeInFlight || !pendingVideoBlob) return;
 
-    const frame = latestVideoData;
-    latestVideoData = null;
+  videoDecodeInFlight = true;
+  const frameBlob = pendingVideoBlob;
+  pendingVideoBlob = null;
 
-    const blob = new Blob([frame], { type: 'image/jpeg' });
-    const nextUrl = URL.createObjectURL(blob);
-    const previousUrl = currentVideoObjectUrl;
+  const nextUrl = URL.createObjectURL(frameBlob);
+  const previousUrl = currentVideoObjectUrl;
 
-    videoImg.onload = () => {
-      if (previousUrl) URL.revokeObjectURL(previousUrl);
-    };
-    videoImg.src = nextUrl;
-    currentVideoObjectUrl = nextUrl;
+  videoImg.onload = () => {
+    if (previousUrl) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    videoDecodeInFlight = false;
+    if (pendingVideoBlob) {
+      renderLatestVideoFrame();
+    }
+  };
 
-    if (latestVideoData) scheduleVideoRender();
-  });
+  videoImg.onerror = () => {
+    URL.revokeObjectURL(nextUrl);
+    if (previousUrl) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    videoDecodeInFlight = false;
+    if (pendingVideoBlob) {
+      renderLatestVideoFrame();
+    }
+  };
+
+  currentVideoObjectUrl = nextUrl;
+  videoImg.src = nextUrl;
 };
 
 const fetchJson = async (url, opts) => {
@@ -51,12 +62,16 @@ const fetchJson = async (url, opts) => {
 
 const startVideo = () => {
   const ws = new WebSocket(`${wsBase}/video_feed`);
-  ws.binaryType = 'arraybuffer';
+  ws.binaryType = 'blob';
   ws.onmessage = (event) => {
-    latestVideoData = event.data;
-    scheduleVideoRender();
+    if (!(event.data instanceof Blob)) return;
+    // Keep only the newest frame while decode/render is busy.
+    pendingVideoBlob = event.data;
+    renderLatestVideoFrame();
   };
   ws.onclose = () => {
+    pendingVideoBlob = null;
+    videoDecodeInFlight = false;
     if (currentVideoObjectUrl) {
       URL.revokeObjectURL(currentVideoObjectUrl);
       currentVideoObjectUrl = null;
