@@ -154,24 +154,7 @@ const discoverRpicamCameras = () => {
 };
 
 const getSupportedResolutions = (cameraPath) => {
-  if (parseRpicamPath(cameraPath) !== null) {
-    const cameraIndex = parseRpicamPath(cameraPath);
-    const cameras = discoverRpicamCameras();
-    const camera = cameras.find((item) => item.index === cameraIndex);
-    if (camera && camera.supportedResolutions && camera.supportedResolutions.length) {
-      return camera.supportedResolutions;
-    }
-    return defaultSupportedResolutions();
-  }
-
-  if (String(cameraPath || '').startsWith('/dev/video') && hasCmd('v4l2-ctl')) {
-    const formats = runCmd(`v4l2-ctl -d ${cameraPath} --list-formats-ext`);
-    if (formats.ok) {
-      const resolutions = parseV4L2MjpegResolutions(formats.stdout);
-      if (resolutions.length) return resolutions;
-    }
-  }
-
+  // Expose one shared resolution set for all cameras.
   return defaultSupportedResolutions();
 };
 
@@ -200,9 +183,7 @@ const listRpicamCameraOptions = () => {
       name: `CSI Camera ${camera.index}: ${camera.descriptor}`,
       supported: check.supported,
       reason: check.reason,
-      supported_resolutions: (camera.supportedResolutions && camera.supportedResolutions.length)
-        ? camera.supportedResolutions
-        : defaultSupportedResolutions()
+      supported_resolutions: defaultSupportedResolutions()
     };
   });
 };

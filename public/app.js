@@ -99,6 +99,25 @@ const fillResolutionOptions = (resolutions, selectedWidth, selectedHeight) => {
   resolutionSelect.innerHTML = '';
   if (!Array.isArray(resolutions) || !resolutions.length) return;
 
+  const hasExactSelection = Number.isFinite(selectedWidth)
+    && Number.isFinite(selectedHeight)
+    && resolutions.some((item) => item.width === selectedWidth && item.height === selectedHeight);
+
+  let closestIndex = 0;
+  if (!hasExactSelection && Number.isFinite(selectedWidth) && Number.isFinite(selectedHeight)) {
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < resolutions.length; i += 1) {
+      const item = resolutions[i];
+      const dw = item.width - selectedWidth;
+      const dh = item.height - selectedHeight;
+      const score = (dw * dw) + (dh * dh);
+      if (score < bestScore) {
+        bestScore = score;
+        closestIndex = i;
+      }
+    }
+  }
+
   for (const item of resolutions) {
     const option = document.createElement('option');
     option.value = `${item.width}x${item.height}`;
@@ -108,15 +127,24 @@ const fillResolutionOptions = (resolutions, selectedWidth, selectedHeight) => {
   }
 
   if (resolutionSelect.selectedIndex === -1) {
-    resolutionSelect.selectedIndex = 0;
+    resolutionSelect.selectedIndex = closestIndex;
   }
 };
 
+const getSelectedResolution = () => {
+  const [width, height] = String(resolutionSelect.value || '')
+    .split('x')
+    .map((value) => Number.parseInt(value, 10));
+  return { width, height };
+};
+
 const updateResolutionForSelectedCamera = (selectedWidth, selectedHeight, fallbackResolutions) => {
+  const resolvedWidth = Number.isFinite(selectedWidth) ? selectedWidth : getSelectedResolution().width;
+  const resolvedHeight = Number.isFinite(selectedHeight) ? selectedHeight : getSelectedResolution().height;
   const resolutions = cameraResolutionsByDevice.get(cameraDevice.value)
     || fallbackResolutions
     || [];
-  fillResolutionOptions(resolutions, selectedWidth, selectedHeight);
+  fillResolutionOptions(resolutions, resolvedWidth, resolvedHeight);
 };
 
 const loadCameraSettings = async () => {
