@@ -911,12 +911,12 @@
                     bestSeq = key;
                 }
             }
-            if (bestSeq < 0) {
-                return;
+            if (bestSeq >= 0) {
+                latestFaceResult = pendingFaceResultsBySeq.get(bestSeq) || null;
+                lastAppliedFaceFrameSeq = Number(latestFaceResult?.broadcast_frame_seq || bestSeq);
+                clearFaceResultsThroughSeq(bestSeq);
             }
-            latestFaceResult = pendingFaceResultsBySeq.get(bestSeq) || null;
-            lastAppliedFaceFrameSeq = Number(latestFaceResult?.broadcast_frame_seq || bestSeq);
-            clearFaceResultsThroughSeq(bestSeq);
+            // Always redraw to ensure overlay stays clear when face recognition is disabled
             drawFaceOverlay();
             updateFrameSyncDebug();
         }

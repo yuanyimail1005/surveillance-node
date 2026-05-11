@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const nodeUrl = require('node:url');
 const nodeUtil = require('node:util');
 const { EventEmitter } = require('events');
 
@@ -18,6 +19,27 @@ const DESCRIPTOR_CACHE_VERSION = 2;
 const loadDeps = async () => {
   if (tf && faceapi) return true;
   try {
+    // node-pre-gyp (used by tfjs-node) still calls deprecated url.resolve in Node 24+.
+    // Use WHATWG URL resolution first and fall back to the original resolver.
+    if (!nodeUrl.__surveillanceResolvePatched && typeof nodeUrl.resolve === 'function') {
+      const originalResolve = nodeUrl.resolve.bind(nodeUrl);
+      nodeUrl.resolve = (from, to) => {
+        if (typeof from === 'string' && typeof to === 'string') {
+          try {
+            return new URL(to, from).toString();
+          } catch (_) {
+            // Fall through to legacy behavior for non-URL-compatible inputs.
+          }
+        }
+        return originalResolve(from, to);
+      };
+      nodeUrl.__surveillanceResolvePatched = true;
+    }
+
+    // tfjs-node still calls util.isArray internally; point it to Array.isArray to avoid DEP0044.
+    if (typeof nodeUtil.isArray !== 'function' || nodeUtil.isArray !== Array.isArray) {
+      nodeUtil.isArray = Array.isArray;
+    }
     if (typeof nodeUtil.isNullOrUndefined !== 'function') {
       nodeUtil.isNullOrUndefined = (value) => value === null || value === undefined;
     }
