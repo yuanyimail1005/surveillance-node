@@ -2,6 +2,8 @@ const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const wsBase = `${proto}://${location.host}`;
 
 const videoImg = document.getElementById('video');
+const videoOverlay = document.getElementById('videoOverlay');
+const faceStatus = document.getElementById('faceStatus');
 const cameraDevice = document.getElementById('cameraDevice');
 const resolutionSelect = document.getElementById('resolution');
 const fpsInput = document.getElementById('fps');
@@ -21,9 +23,87 @@ let nextAudioPlayTime = 0;
 let droppedAudioChunks = 0;
 let speakerMeterSmooth = 0;
 let micMeterSmooth = 0;
+let latestFaces = [];
+let latestFaceImageSize = { width: 0, height: 0 };
 
 const AUDIO_MIN_LEAD_SECONDS = 0.02;
 const AUDIO_MAX_BUFFER_SECONDS = 0.4;
+
+const syncVideoOverlaySize = () => {
+  const w = videoImg.clientWidth;
+  const h = videoImg.clientHeight;
+  if (!w || !h) return;
+  if (videoOverlay.width !== w) videoOverlay.width = w;
+  if (videoOverlay.height !== h) videoOverlay.height = h;
+};
+
+/**
+ * Draw server-sent face boxes onto the overlay canvas.
+ * faces: array of { name, confidence, left, top, right, bottom } in image coordinates.
+ * imageWidth/Height: original JPEG dimensions used to scale into display dimensions.
+ */
+const drawFaceOverlay = (faces, imageWidth, imageHeight) => {
+  const ctx = videoOverlay.getContext('2d');
+  if (!ctx) return;
+  syncVideoOverlaySize();
+  ctx.clearRect(0, 0, videoOverlay.width, videoOverlay.height);
+  if (!Array.isArray(faces) || !faces.length) return;
+
+  const dw = videoOverlay.width;
+  const dh = videoOverlay.height;
+  const scaleX = imageWidth > 0 ? dw / imageWidth : 1;
+  const scaleY = imageHeight > 0 ? dh / imageHeight : 1;
+
+  ctx.lineWidth = 2;
+  ctx.font = '13px sans-serif';
+
+  for (const face of faces) {
+    const x = Math.max(0, Math.round(face.left * scaleX));
+    const y = Math.max(0, Math.round(face.top * scaleY));
+    const w = Math.max(1, Math.round((face.right - face.left) * scaleX));
+    const h = Math.max(1, Math.round((face.bottom - face.top) * scaleY));
+    const isKnown = face.name && face.name !== 'Unknown';
+    const colour = isKnown ? '#47d169' : '#f0a500';
+    const label = isKnown
+      ? `${face.name} (${Math.round(face.confidence * 100)}%)`
+      : 'Unknown';
+
+    ctx.strokeStyle = colour;
+    ctx.fillStyle = isKnown ? 'rgba(71, 209, 105, 0.12)' : 'rgba(240, 165, 0, 0.12)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+
+    const textW = Math.ceil(ctx.measureText(label).width) + 10;
+    const textX = x;
+    const textY = Math.max(16, y - 4);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+    ctx.fillRect(textX, textY - 14, textW, 17);
+    ctx.fillStyle = isKnown ? '#ddffe6' : '#ffe9b0';
+    ctx.fillText(label, textX + 5, textY - 1);
+  }
+};
+
+/** Handle a face_data JSON message pushed by the server over the video WebSocket. */
+const handleServerFaceData = (msg) => {
+  const result = msg.result || {};
+  latestFaceImageSize = { width: result.image_width || 0, height: result.image_height || 0 };
+  latestFaces = Array.isArray(result.faces) ? result.faces : [];
+  drawFaceOverlay(latestFaces, latestFaceImageSize.width, latestFaceImageSize.height);
+
+  if (!msg.enabled) {
+    setFaceStatus('Face AI: disabled');
+  } else if (!msg.available) {
+    setFaceStatus(`Face AI: ${msg.message || 'unavailable'}`);
+  } else {
+    const n = latestFaces.length;
+    const knownStr = msg.known_faces_count > 0 ? ` · ${msg.known_faces_count} known` : '';
+    setFaceStatus(`Face AI: ready${knownStr} · ${n} face${n === 1 ? '' : 's'} detected`);
+  }
+};
+
+const setFaceStatus = (text) => {
+  if (faceStatus) faceStatus.textContent = text;
+};
 
 const renderLatestVideoFrame = () => {
   if (videoDecodeInFlight || !pendingVideoBlob) return;
@@ -39,6 +119,8 @@ const renderLatestVideoFrame = () => {
     if (previousUrl) {
       URL.revokeObjectURL(previousUrl);
     }
+    syncVideoOverlaySize();
+    drawFaceOverlay(latestFaces, latestFaceImageSize.width, latestFaceImageSize.height);
     videoDecodeInFlight = false;
     if (pendingVideoBlob) {
       renderLatestVideoFrame();
@@ -71,12 +153,23 @@ const startVideo = () => {
   const ws = new WebSocket(`${wsBase}/video_feed`);
   ws.binaryType = 'blob';
   ws.onmessage = (event) => {
-    if (!(event.data instanceof Blob)) return;
-    // Keep only the newest frame while decode/render is busy.
-    pendingVideoBlob = event.data;
-    renderLatestVideoFrame();
+    if (event.data instanceof Blob) {
+      // Binary JPEG frame — keep only the newest while decode/render is busy.
+      pendingVideoBlob = event.data;
+      renderLatestVideoFrame();
+    } else if (typeof event.data === 'string') {
+      // JSON message from the server (face_data, etc.).
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'face_data') handleServerFaceData(msg);
+      } catch (_) {}
+    }
   };
   ws.onclose = () => {
+    latestFaces = [];
+    latestFaceImageSize = { width: 0, height: 0 };
+    drawFaceOverlay(latestFaces, 0, 0);
+    setFaceStatus('Face AI: server not connected');
     pendingVideoBlob = null;
     videoDecodeInFlight = false;
     if (currentVideoObjectUrl) {
@@ -465,3 +558,8 @@ document.getElementById('talkToggle').onclick = async () => {
   await loadAudioDevices();
   await loadVolume();
 })();
+
+window.addEventListener('resize', () => {
+  syncVideoOverlaySize();
+  drawFaceOverlay(latestFaces, latestFaceImageSize.width, latestFaceImageSize.height);
+});

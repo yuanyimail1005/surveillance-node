@@ -34,7 +34,10 @@ const state = {
   videoSubscribers: new Set(),
   audioSubscribers: new Set(),
 
-  videoBuffer: Buffer.alloc(0)
+  videoBuffer: Buffer.alloc(0),
+  frameSeq: 0,
+  videoFrameHook: null,
+  shuttingDown: false
 };
 
 const maxWsBufferedBytes = 512 * 1024;
@@ -321,6 +324,8 @@ const startCamera = () => {
     }
     if (latestJpg) {
       // Keep stream close to real-time by dropping stale frames and sending only the latest complete JPEG.
+      state.frameSeq += 1;
+      if (state.videoFrameHook) state.videoFrameHook(latestJpg, state.frameSeq);
       broadcastBinary(state.videoSubscribers, latestJpg);
     }
   });
@@ -328,7 +333,7 @@ const startCamera = () => {
   proc.on('exit', () => {
     if (state.cameraProc === proc) {
       state.cameraProc = null;
-      setTimeout(() => startCamera(), 300);
+      if (!state.shuttingDown) setTimeout(() => startCamera(), 300);
     }
   });
 
@@ -353,7 +358,7 @@ const startAudioCapture = () => {
   proc.on('exit', () => {
     if (state.audioCaptureProc === proc) {
       state.audioCaptureProc = null;
-      setTimeout(() => startAudioCapture(), 300);
+      if (!state.shuttingDown) setTimeout(() => startAudioCapture(), 300);
     }
   });
   return true;
@@ -377,6 +382,16 @@ const startAudioPlayback = () => {
     }
   });
   return true;
+};
+
+const shutdown = () => {
+  state.shuttingDown = true;
+  stopProc(state.cameraProc);
+  stopProc(state.audioCaptureProc);
+  stopProc(state.audioPlaybackProc);
+  state.cameraProc = null;
+  state.audioCaptureProc = null;
+  state.audioPlaybackProc = null;
 };
 
 const ensureStarted = () => {
@@ -467,6 +482,19 @@ const writeTalkback = (monoChunk) => {
   return state.audioPlaybackProc.stdin.write(stereo);
 };
 
+const setVideoFrameHook = (fn) => {
+  state.videoFrameHook = fn;
+};
+
+const broadcastVideoJson = (payload) => {
+  const text = JSON.stringify(payload);
+  for (const ws of state.videoSubscribers) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(text, { binary: false }, () => {});
+    }
+  }
+};
+
 const subscribeVideo = (ws) => {
   state.videoSubscribers.add(ws);
 };
@@ -549,6 +577,9 @@ const selectServerAudioDevices = (payload) => {
 module.exports = {
   state,
   ensureStarted,
+  shutdown,
+  setVideoFrameHook,
+  broadcastVideoJson,
   subscribeVideo,
   unsubscribeVideo,
   subscribeAudio,

@@ -8,7 +8,11 @@ RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
-      gnupg; \
+      gnupg \
+      g++ \
+      make \
+      pkg-config \
+      python3; \
     mkdir -p /etc/apt/keyrings; \
     curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
       | gpg --dearmor -o /etc/apt/keyrings/raspberrypi-archive-keyring.gpg; \
@@ -28,7 +32,11 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN set -eux; \
+    npm install --omit=dev; \
+    node -e "require('@tensorflow/tfjs-node')" || \
+      (cd node_modules/@tensorflow/tfjs-node && npm run build-addon-from-source); \
+    node -e "require('@tensorflow/tfjs-node')"
 
 COPY . .
 
