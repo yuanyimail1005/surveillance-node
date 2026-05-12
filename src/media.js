@@ -26,6 +26,8 @@ const state = {
   activeCameraDevice: null,
   pulseSinkName,
   pulseCaptureSourceName,
+  pulseStartedByApp: false,
+  pulseLocalEnv: null,
 
   cameraProc: null,
   audioCaptureProc: null,
@@ -54,6 +56,70 @@ const runCmd = (cmd) => {
     stdout: result.stdout || '',
     stderr: result.stderr || ''
   };
+};
+
+const runCmdWithEnv = (cmd, envOverrides) => {
+  const result = spawnSync('sh', ['-lc', cmd], {
+    encoding: 'utf8',
+    env: { ...process.env, ...envOverrides }
+  });
+  return {
+    ok: result.status === 0,
+    stdout: result.stdout || '',
+    stderr: result.stderr || ''
+  };
+};
+
+const pulseEnvForChild = () => {
+  if (!state.pulseLocalEnv) return process.env;
+  return { ...process.env, ...state.pulseLocalEnv };
+};
+
+const runPulseCmd = (cmd) => {
+  if (!state.pulseLocalEnv) return runCmd(cmd);
+  return runCmdWithEnv(cmd, state.pulseLocalEnv);
+};
+
+const ensurePulseAudioReady = () => {
+  // Try external PulseAudio session first (for Docker with host Pulse socket mounted).
+  const externalProbe = runCmd('pactl info');
+  if (externalProbe.ok) {
+    state.pulseLocalEnv = null;
+    return true;
+  }
+
+  // Fallback: try to start local daemon (mirrors Python service behavior).
+  if (!hasCmd('pulseaudio')) return false;
+
+  const localEnv = {
+    XDG_RUNTIME_DIR: '/tmp/pulse-runtime',
+    PULSE_SERVER: '',
+    PULSE_COOKIE: ''
+  };
+
+  runCmdWithEnv('mkdir -p /tmp/pulse-runtime && chmod 700 /tmp/pulse-runtime', localEnv);
+  // Use the same command as Python: --start (start if not running), --daemonize=true (background),
+  // --exit-idle-time=-1 (never exit due to idle). Limited success in Docker without host audio hardware.
+  // Primary solution: mount host Pulse socket via docker-compose (see docker-compose.yml).
+  const start = runCmdWithEnv('pulseaudio --start --daemonize=true --exit-idle-time=-1', localEnv);
+  
+  // Verify daemon is accessible before declaring success
+  const probe = runCmdWithEnv('pactl info', localEnv);
+  if (!probe.ok) return false;
+
+  state.pulseLocalEnv = localEnv;
+  state.pulseStartedByApp = true;
+  return true;
+};
+
+const stopPulseAudioIfStartedByApp = () => {
+  if (!state.pulseStartedByApp) return;
+  runCmdWithEnv('pulseaudio --kill', state.pulseLocalEnv || {
+    XDG_RUNTIME_DIR: '/tmp/pulse-runtime',
+    PULSE_SERVER: '',
+    PULSE_COOKIE: ''
+  });
+  state.pulseStartedByApp = false;
 };
 
 const toResolutionObjects = (pairs) => {
@@ -341,6 +407,7 @@ const startCamera = () => {
 };
 
 const startAudioCapture = () => {
+  if (!ensurePulseAudioReady()) return false;
   stopProc(state.audioCaptureProc);
   const proc = spawn('parec', [
     '--device', state.pulseCaptureSourceName,
@@ -348,7 +415,7 @@ const startAudioCapture = () => {
     '--rate', String(sampleRate),
     '--channels', String(micChannels),
     '--raw'
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  ], { stdio: ['ignore', 'pipe', 'ignore'], env: pulseEnvForChild() });
 
   state.audioCaptureProc = proc;
   proc.stdout.on('data', (chunk) => {
@@ -365,6 +432,7 @@ const startAudioCapture = () => {
 };
 
 const startAudioPlayback = () => {
+  if (!ensurePulseAudioReady()) return false;
   stopProc(state.audioPlaybackProc);
   const proc = spawn('pacat', [
     '--playback',
@@ -374,7 +442,7 @@ const startAudioPlayback = () => {
     '--channels', String(speakerChannels),
     '--device', state.pulseSinkName,
     '--stream-name', 'surveillance-speaker'
-  ], { stdio: ['pipe', 'ignore', 'ignore'] });
+  ], { stdio: ['pipe', 'ignore', 'ignore'], env: pulseEnvForChild() });
   state.audioPlaybackProc = proc;
   proc.on('exit', () => {
     if (state.audioPlaybackProc === proc) {
@@ -392,6 +460,7 @@ const shutdown = () => {
   state.cameraProc = null;
   state.audioCaptureProc = null;
   state.audioPlaybackProc = null;
+  stopPulseAudioIfStartedByApp();
 };
 
 const ensureStarted = () => {
@@ -421,7 +490,8 @@ const normalizeCameraSettings = (width, height, fps, supportedResolutions) => {
 };
 
 const listCaptureDevices = () => {
-  const out = runCmd('pactl list short sources');
+  if (!ensurePulseAudioReady()) return [{ id: '@DEFAULT_SOURCE@', name: 'Default microphone', kind: 'default' }];
+  const out = runPulseCmd('pactl list short sources');
   const devices = [{ id: '@DEFAULT_SOURCE@', name: 'Default microphone', kind: 'default' }];
   if (!out.ok) return devices;
   for (const line of out.stdout.split('\n')) {
@@ -435,7 +505,8 @@ const listCaptureDevices = () => {
 };
 
 const listOutputSinks = () => {
-  const out = runCmd('pactl list short sinks');
+  if (!ensurePulseAudioReady()) return [{ id: '@DEFAULT_SINK@', name: 'Default speaker', kind: 'default' }];
+  const out = runPulseCmd('pactl list short sinks');
   const sinks = [{ id: '@DEFAULT_SINK@', name: 'Default speaker', kind: 'default' }];
   if (!out.ok) return sinks;
   for (const line of out.stdout.split('\n')) {
@@ -448,16 +519,18 @@ const listOutputSinks = () => {
 };
 
 const getSpeakerVolume = () => {
+  if (!ensurePulseAudioReady()) return null;
   const sink = state.pulseSinkName || '@DEFAULT_SINK@';
-  const out = runCmd(`pactl get-sink-volume ${sink}`);
+  const out = runPulseCmd(`pactl get-sink-volume ${sink}`);
   if (!out.ok) return null;
   const match = out.stdout.match(/(\d{1,3})%/);
   return match ? Number.parseInt(match[1], 10) : null;
 };
 
 const setSpeakerVolume = (volume) => {
+  if (!ensurePulseAudioReady()) return false;
   const sink = state.pulseSinkName || '@DEFAULT_SINK@';
-  return runCmd(`pactl set-sink-volume ${sink} ${volume}%`).ok;
+  return runPulseCmd(`pactl set-sink-volume ${sink} ${volume}%`).ok;
 };
 
 const convertMonoToStereo = (monoBuffer, gain) => {
