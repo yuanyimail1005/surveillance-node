@@ -44,16 +44,25 @@ known_faces/
 
 On first load, descriptors are computed and cached in `.face_descriptor_cache.json` inside the known-faces directory.
 
+## Architecture Support
+
+The Dockerfile is now **multi-architecture safe**:
+
+- **Raspberry Pi (arm64, armhf):** Installs `rpicam-apps` for CSI camera support via the official Raspberry Pi repository.
+- **x86_64 / amd64 (generic Linux):** Skips Pi-specific packages and uses standard V4L2 camera devices (`/dev/video*`).
+
 ## Prerequisites
 
 ### Local runtime
 
-- Linux host, typically Raspberry Pi OS / Debian Bookworm
+- Linux host: Raspberry Pi OS / Debian Bookworm (recommended for Pi), or any x86_64 distribution
 - Node.js 20 recommended
 - `ffmpeg`
 - `pulseaudio` and `pulseaudio-utils`
 - `v4l2-ctl`
-- Camera devices available on the host (`/dev/video*` or CSI via `rpicam-apps`)
+- Camera devices available on the host:
+  - **Raspberry Pi:** `/dev/video*` or CSI camera via `rpicam-apps`
+  - **Generic Linux:** Standard V4L2 USB/webcam devices at `/dev/video*`
 
 For local installs on `arm64`, `@tensorflow/tfjs-node` may need to build its native addon from source. If the addon was installed for the wrong architecture, rebuild it with:
 
@@ -163,7 +172,10 @@ sudo docker compose logs -f surveillance-node
 ### Docker notes
 
 - The container uses `network_mode: host`, so port `5000` must be free on the host.
-- The image installs `rpicam-apps`, `ffmpeg`, PulseAudio tools, and V4L2 utilities.
+- **Multi-architecture support:** The image automatically detects the host architecture:
+  - On **Raspberry Pi (arm64/armhf):** installs `rpicam-apps` for CSI camera support.
+  - On **x86_64/amd64:** skips Pi-specific packages and uses standard V4L2 devices.
+- The image installs `ffmpeg`, PulseAudio tools, and V4L2 utilities on all architectures.
 - TLS cert and key are mounted into `/app/cert.pem` and `/app/key.pem`.
 - Device access is granted through `/dev`, `/dev/snd`, and the `audio` / `video` groups.
 - If you want face recognition in Docker, mount your known-faces directory into the container and set `FACE_RECOGNITION_KNOWN_FACES_DIR` to the in-container path. The current compose file does not mount a known-faces directory by default.
